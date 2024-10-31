@@ -5,6 +5,7 @@
  */
 
 #include <fcntl.h>
+#include <libudev.h>
 #include <linux/input.h>
 #include <poll.h>
 #include <pthread.h>
@@ -18,6 +19,10 @@
 
 #define EVDEV_CNT_MAX 32
 #define EVDEV_NAME_SIZE_MAX 50
+#define EVDEV_IDX_START 1
+
+#define UDEV_RESERVED_CNT 1
+#define UDEV_EVDEV_FD_CNT (EVDEV_CNT_MAX + EVDEV_IDX_START)
 
 typedef struct {
     twin_screen_t *screen;
@@ -101,9 +106,73 @@ static void twin_linux_input_events(struct input_event *ev,
     }
 }
 
-static void *twin_linux_evdev_thread(void *arg)
+static int twin_linux_udev_init(struct udev **udev, struct udev_monitor **mon)
 {
-    twin_linux_input_t *tm = arg;
+    /* Create udev object */
+    *udev = udev_new();
+    if (!*udev) {
+        log_error("Failed to create udev object");
+        return -1;
+    }
+
+    /* Create a monitor for kernel events */
+    *mon = udev_monitor_new_from_netlink(*udev, "udev");
+    if (!*mon) {
+        log_error("Failed to create udev monitor");
+        udev_unref(*udev);
+        return -1;
+    }
+
+    /* Filter for input subsystem */
+    udev_monitor_filter_add_match_subsystem_devtype(*mon, "input", NULL);
+    udev_monitor_enable_receiving(*mon);
+
+    /* File descriptor for the monitor */
+    return udev_monitor_get_fd(*mon);
+}
+
+static bool twin_linux_udev_update(struct udev_monitor *mon)
+{
+    struct udev_device *dev = NULL;
+
+    /* Get the device that caused the event */
+    dev = udev_monitor_receive_device(mon);
+    if (dev) {
+        const char *action = udev_device_get_action(dev);
+        const char *dev_node = udev_device_get_devnode(dev);
+
+        if (action && dev_node) {
+            const char *keyboard =
+                udev_device_get_property_value(dev, "ID_INPUT_KEYBOARD");
+            const char *mouse =
+                udev_device_get_property_value(dev, "ID_INPUT_MOUSE");
+
+            /* Ensure udev event is for mouse or keyboard */
+            if (!keyboard && !mouse) {
+                udev_device_unref(dev);
+                return false;
+            }
+
+            /* Capture only add and remove events */
+            if (!strcmp(action, "add") || !strcmp(action, "remove")) {
+                log_info("udev: %s: %s", action, dev_node);
+                udev_device_unref(dev);
+                return true;
+            }
+        }
+    }
+
+    /* No event is caputured */
+    return false;
+}
+
+static void twin_linux_edev_open(struct pollfd *pfds)
+{
+    /* Reset evdev fd table */
+    for (int i = 0; i < evdev_cnt; i++) {
+        close(evdev_fd[i]);
+    }
+    evdev_cnt = 0;
 
     /* Open all event devices */
     char evdev_name[EVDEV_NAME_SIZE_MAX] = {0};
@@ -116,22 +185,53 @@ static void *twin_linux_evdev_thread(void *arg)
         }
     }
 
-    /* Initialize pollfd array */
-    struct pollfd pfds[EVDEV_CNT_MAX];
-    for (int i = 0; i < evdev_cnt; i++) {
-        pfds[i].fd = evdev_fd[i];
+    /* Initialize evdev poll file descriptors  */
+    for (int i = EVDEV_IDX_START; i < evdev_cnt + UDEV_RESERVED_CNT; i++) {
+        pfds[i].fd = evdev_fd[i - 1];
         pfds[i].events = POLLIN;
     }
+}
+
+static void *twin_linux_evdev_thread(void *arg)
+{
+    twin_linux_input_t *tm = arg;
+
+    struct udev *udev = NULL;
+    struct udev_monitor *mon = NULL;
+
+    /* Open Linux udev (user space device manager) */
+    int udev_fd = twin_linux_udev_init(&udev, &mon);
+    if (udev_fd < 0) {
+        exit(2);
+    }
+
+    /* Place the udev fd into the poll fds */
+    struct pollfd pfds[UDEV_EVDEV_FD_CNT];
+    pfds[0].fd = udev_fd;
+    pfds[0].events = POLLIN;
+
+    /* Open event devices */
+    twin_linux_edev_open(pfds);
 
     /* Event polling */
     struct input_event ev;
     while (1) {
         /* Wait until any event is available */
-        if (poll(pfds, evdev_cnt, -1) <= 0)
+        if (poll(pfds, evdev_cnt + UDEV_RESERVED_CNT, -1) <= 0)
             continue;
 
         /* Iterate through all file descriptors */
-        for (int i = 0; i < evdev_cnt; i++) {
+        for (int i = 0; i < evdev_cnt + UDEV_RESERVED_CNT; i++) {
+            if (i == 0) {
+                /* Check udev event */
+                if (twin_linux_udev_update(mon)) {
+                    /* Re-open event devices */
+                    twin_linux_edev_open(pfds);
+                    break;
+                }
+                continue;
+            }
+
             /* Try reading events */
             ssize_t n = read(pfds[i].fd, &ev, sizeof(ev));
             if (n == sizeof(ev)) {
@@ -140,6 +240,10 @@ static void *twin_linux_evdev_thread(void *arg)
             }
         }
     }
+
+    /* Clean up */
+    udev_monitor_unref(mon);
+    udev_unref(udev);
 
     return NULL;
 }
